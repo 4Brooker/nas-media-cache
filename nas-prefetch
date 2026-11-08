@@ -124,10 +124,12 @@ folder_of() {
 
 # Reads NUL-separated paths from stdin with PARALLEL threads under one shared bandwidth limit,
 # and prints each path (NUL-terminated) once it has been read completely.
+# On an NFS mount the limit and the measurement use the mount's network counter
+# (/proc/self/mountstats): files already in the local cache are read at full speed and do not
+# count. Elsewhere they use the bytes read.
 # Percentage mode first runs at full speed until MEASURE_SECONDS or MEASURE_FILES is reached,
-# then limits to that percentage of the measured speed. On an NFS mount the speed comes from the
-# mount's network counter (/proc/self/mountstats), so files already in the cache (read from local
-# disk) do not inflate it; a measurement with less than 1 MiB of network traffic starts over.
+# then limits to that percentage of the measured speed. A measurement with less than 1 MiB of
+# network traffic, or where most data came from the cache, starts over.
 # Writes the current limit to INFOFILE: "measuring", or "limit BYTES_PER_S [MEASURED_MAX]".
 # Time while the process is stopped (Pause) or suspended is not counted.
 # Args: PARALLEL MODE(none|flat|pct) VALUE MEASURE_SECONDS MEASURE_FILES INFOFILE NFS_MOUNTPOINT
@@ -153,29 +155,66 @@ def info(text):
     os.replace(infofile + ".tmp", infofile)
 
 
+def network_bytes():
+    """Bytes this NFS mount has read from the server, or None if unavailable."""
+    try:
+        with open("/proc/self/mountstats") as f:
+            section = False
+            for line in f:
+                if line.startswith("device "):
+                    m = re.search(r" mounted on (\S+) with fstype nfs", line)
+                    path = m and re.sub(r"\\([0-7]{3})", lambda o: chr(int(o.group(1), 8)), m.group(1))
+                    section = bool(mountpoint) and path == mountpoint
+                elif section and line.split()[:1] == ["bytes:"]:
+                    return int(line.split()[5])  # serverreadbytes
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
+
+
+# What the limit and the measurement count: network traffic of the mount, or bytes read
+NETWORK = network_bytes() is not None
+traffic = network_bytes if NETWORK else (lambda: nread)
+
+
 class Bucket:
-    """Token bucket shared by all threads; rate 0 means unlimited."""
+    """Token bucket shared by all threads; rate 0 means unlimited. A background thread adds
+    `rate` bytes per second. Network traffic is subtracted by that thread as the counter rises,
+    so cache hits cost nothing; without a network counter, readers subtract what they read.
+    Readers wait while the bucket is negative."""
 
     def __init__(self, rate):
         self.lock = threading.Lock()
-        self.set(rate)
+        self.rate, self.tokens = rate, 0.0
+        threading.Thread(target=self.run, daemon=True).start()
 
     def set(self, rate):
         with self.lock:
-            self.rate, self.tokens, self.t = rate, 0.0, time.monotonic()
+            self.tokens, self.rate = 0.0, rate
 
-    def take(self, n):
-        with self.lock:
-            now = time.monotonic()
-            if self.rate <= 0:
-                return
-            # Cap the refill, so a pause does not lead to a burst afterwards
-            burst = max(self.rate / 2, CHUNK)
-            self.tokens = min(self.tokens + (now - self.t) * self.rate, burst) - n
-            self.t = now
-            wait = -self.tokens / self.rate if self.tokens < 0 else 0
-        if wait:
-            time.sleep(wait)
+    def run(self):
+        last_t, last_b = time.monotonic(), traffic()
+        while True:
+            time.sleep(0.05)
+            now, b = time.monotonic(), traffic()
+            dt = min(now - last_t, 0.1)  # skip time spent paused
+            with self.lock:
+                if self.rate > 0:
+                    # Cap the refill, so an idle moment does not lead to a burst afterwards
+                    burst = max(self.rate / 2, CHUNK)
+                    used = b - last_b if NETWORK else 0
+                    self.tokens = min(self.tokens + dt * self.rate - used, burst)
+            last_t, last_b = now, b
+
+    def read(self, n):
+        if not NETWORK:
+            with self.lock:
+                if self.rate > 0:
+                    self.tokens -= n
+
+    def wait(self):
+        while self.rate > 0 and self.tokens < 0:
+            time.sleep(0.05)
 
 
 bucket = Bucket(value if mode == "flat" else 0)
@@ -195,10 +234,14 @@ def worker():
                     # No kernel read-ahead, so the network follows the limit smoothly
                     # instead of fetching 16 MB bursts at full speed
                     os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
-                while n := f.readinto(buf):
+                while True:
+                    bucket.wait()
+                    n = f.readinto(buf)
+                    if not n:
+                        break
                     with lock:
                         nread += n
-                    bucket.take(n)
+                    bucket.read(n)
         except OSError as e:
             print(f"nas-prefetch: {e}", file=sys.stderr)
             continue
@@ -208,34 +251,17 @@ def worker():
             sys.stdout.buffer.flush()
 
 
-def network_bytes():
-    """Bytes this NFS mount has read from the server, or None if unavailable."""
-    try:
-        with open("/proc/self/mountstats") as f:
-            section = False
-            for line in f:
-                if line.startswith("device "):
-                    m = re.search(r" mounted on (\S+) with fstype nfs", line)
-                    path = m and re.sub(r"\\([0-7]{3})", lambda o: chr(int(o.group(1), 8)), m.group(1))
-                    section = bool(mountpoint) and path == mountpoint
-                elif section and line.split()[:1] == ["bytes:"]:
-                    return int(line.split()[5])  # serverreadbytes
-    except (OSError, IndexError, ValueError):
-        pass
-    return None
-
-
 def measure():
-    source = network_bytes if network_bytes() is not None else (lambda: nread)
     while True:
-        bytes0, files0, active, last = source(), ndone, 0.0, time.monotonic()
+        net0, read0, files0, active, last = traffic(), nread, ndone, 0.0, time.monotonic()
         while active < measure_s and ndone - files0 < measure_n:
             time.sleep(0.1)
             now = time.monotonic()
             active += min(now - last, 0.1)  # skip time spent paused
             last = now
-        got = source() - bytes0
-        if got >= CHUNK:
+        got = traffic() - net0
+        # Mostly read from the cache: that says nothing about the network, so try again
+        if got >= CHUNK and got >= (nread - read0) / 2:
             break
     top = got / active
     limit = max(top * value / 100, 1024)
@@ -282,7 +308,9 @@ bandwidth_text() {
 # Reads the files, printing zenity-style progress: a percentage line and a "# text" line per file.
 # The text lines are separated by a literal \n: the current folder, the totals, the bandwidth.
 run() {
-  local done=0 n=0 start=$SECONDS f elapsed rate eta paused where bwtext now last=0
+  local done=0 n=0 f elapsed rate eta speed paused where bwtext now last=0
+  # Speed and time left are based on the last minute: samples of time, bytes done, seconds paused
+  local -a sample_t=() sample_done=() sample_paused=()
   printf '%s\0' "${files[@]}" |
     python3 -I -c "$READER" "$PARALLEL" "$bw_mode" "$bw_value" "$MEASURE_SECONDS" "$MEASURE_FILES" \
       "$infofile" "$nfs_mount" |
@@ -295,17 +323,38 @@ run() {
       last=$now
       paused=0
       read -r paused < "$pausefile" || true
-      elapsed=$((SECONDS - start - ${paused:-0}))
-      rate=$((done / (elapsed > 0 ? elapsed : 1)))
-      eta=$(((total - done) / (rate > 0 ? rate : 1)))
+      paused=${paused:-0}
+      sample_t+=("$now") sample_done+=("$done") sample_paused+=("$paused")
+      while ((${#sample_t[@]} > 2 && now - sample_t[1] >= 60000000)); do
+        sample_t=("${sample_t[@]:1}") sample_done=("${sample_done[@]:1}") sample_paused=("${sample_paused[@]:1}")
+      done
+      # Microseconds since the oldest sample, minus the time paused since then
+      elapsed=$(((now - sample_t[0]) - (paused - sample_paused[0]) * 1000000))
+      if ((${#sample_t[@]} > 1 && elapsed > 0)); then
+        rate=$(((done - sample_done[0]) * 1000000 / elapsed))
+      else
+        rate=0
+      fi
+      if ((rate > 0)); then
+        eta=$(((total - done) / rate))
+        if ((eta >= 3600)); then
+          eta=$(printf '%dh%02dm' $((eta / 3600)) $((eta % 3600 / 60)))
+        elif ((eta >= 60)); then
+          eta="$((eta / 60))m"
+        else
+          eta="<1m"
+        fi
+        speed="$(human "$rate")/s  ·  ~$eta left"
+      else
+        speed="estimating time left..."
+      fi
       where=$(folder_of "$f")
       where=${where//\\/\\\\}  # zenity unescapes the text
       bwtext=
       [[ $bw_mode == none ]] || bwtext="\\n$(bandwidth_text)"
       # Text before percentage: zenity --auto-close exits as soon as it reads 100
-      printf '# Fetching: %s\\n%d of %d files  ·  %s of %s  ·  %s/s  ·  ~%dh%02dm left%s\n' \
-        "$where" "$n" "$count" "$(human "$done")" "$(human "$total")" "$(human "$rate")" \
-        $((eta / 3600)) $((eta % 3600 / 60)) "$bwtext"
+      printf '# Fetching: %s\\n%d of %d files  ·  %s of %s  ·  %s%s\n' \
+        "$where" "$n" "$count" "$(human "$done")" "$(human "$total")" "$speed" "$bwtext"
       echo $((done * 100 / total))
     done
 }
@@ -318,15 +367,23 @@ if $gui; then
   run > "$status" &
   job=$!
   set +m
+  # The job has its own process group, so stop it explicitly if this script is killed
+  dialog_pid=
+  trap 'kill -TERM -- -"$job" 2>/dev/null; kill -CONT -- -"$job" 2>/dev/null
+        [[ -n $dialog_pid ]] && kill "$dialog_pid" 2>/dev/null; exit 1' TERM INT HUP
+  # Runs a dialog in the background and waits for it. Bash only runs a trap once the foreground
+  # command has finished, while `wait` is interrupted at once. The explicit <&0 keeps stdin,
+  # which a background command would otherwise get replaced by /dev/null.
+  dialog() { "$@" <&0 & dialog_pid=$!; wait "$dialog_pid"; }
   paused=0
   while kill -0 "$job" 2>/dev/null; do
-    zenity --progress --title="NAS prefetch" --width=500 --auto-close --cancel-label="Pause" \
+    dialog zenity --progress --title="NAS prefetch" --width=500 --auto-close --cancel-label="Pause" \
       --text="Prefetching $count files ($(human "$total")) from ${dirs[*]}..." \
       < <(tail -n 2 -f --pid="$job" "$status") && break
     kill -0 "$job" 2>/dev/null || break
     kill -STOP -- -"$job" 2>/dev/null || true
     pause_start=$SECONDS
-    if zenity --question --default-cancel --title="NAS prefetch" --width=350 \
+    if dialog zenity --question --default-cancel --title="NAS prefetch" --width=350 \
         --ok-label="Stop prefetch" --cancel-label="Resume" \
         --text="Prefetch paused: ${dirs[*]}\n\nFiles loaded so far stay cached."; then
       # A stopped process only acts on TERM once it is continued
