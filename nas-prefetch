@@ -130,15 +130,18 @@ folder_of() {
 # Percentage mode first runs at full speed until MEASURE_SECONDS or MEASURE_FILES is reached,
 # then limits to that percentage of the measured speed. A measurement with less than 1 MiB of
 # network traffic, or where most data came from the cache, starts over.
-# Writes the current limit to INFOFILE: "measuring", or "limit BYTES_PER_S [MEASURED_MAX]".
+# Writes the current limit to INFOFILE: "measuring", or "limit BYTES_PER_S [MEASURED_MAX]",
+# and the number of bytes read so far to READFILE twice per second. Once per second it also
+# prints an empty entry (a lone NUL), so the progress display updates during large files.
 # Time while the process is stopped (Pause) or suspended is not counted.
 # Args: PARALLEL MODE(none|flat|pct) VALUE MEASURE_SECONDS MEASURE_FILES INFOFILE NFS_MOUNTPOINT
+#       READFILE
 READER=$(cat <<'PY'
 import os, re, sys, threading, time
 
 parallel, mode, value = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
 measure_s, measure_n = float(sys.argv[4]), int(sys.argv[5])
-infofile, mountpoint = sys.argv[6], sys.argv[7]
+infofile, mountpoint, readfile = sys.argv[6], sys.argv[7], sys.argv[8]
 CHUNK = 1 << 20
 
 files = sys.stdin.buffer.read().split(b"\0")
@@ -149,10 +152,26 @@ lock = threading.Lock()
 nread = ndone = 0
 
 
-def info(text):
-    with open(infofile + ".tmp", "w") as f:
+def write(path, text):
+    with open(path + ".tmp", "w") as f:
         f.write(text + "\n")
-    os.replace(infofile + ".tmp", infofile)
+    os.replace(path + ".tmp", path)
+
+
+def info(text):
+    write(infofile, text)
+
+
+def report():
+    tick = 0
+    while True:
+        write(readfile, str(nread))
+        tick += 1
+        if tick % 2 == 0:
+            with lock:
+                sys.stdout.buffer.write(b"\0")
+                sys.stdout.buffer.flush()
+        time.sleep(0.5)
 
 
 def network_bytes():
@@ -269,6 +288,7 @@ def measure():
     info(f"limit {limit:.0f} {top:.0f}")
 
 
+threading.Thread(target=report, daemon=True).start()
 if mode == "pct":
     info("measuring")
     threading.Thread(target=measure, daemon=True).start()
@@ -285,8 +305,9 @@ PY
 # Temporary files: progress, seconds paused, bandwidth info
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-status=$tmp/status pausefile=$tmp/paused infofile=$tmp/bandwidth
+status=$tmp/status pausefile=$tmp/paused infofile=$tmp/bandwidth readfile=$tmp/read
 echo 0 > "$pausefile"
+echo 0 > "$readfile"
 : > "$infofile"
 nfs_mount=$(findmnt -no FSTYPE,TARGET -T "${dirs[0]}" | awk '$1 ~ /^nfs/ { sub(/^[^ ]+ +/, ""); print }')
 
@@ -308,15 +329,24 @@ bandwidth_text() {
 # Reads the files, printing zenity-style progress: a percentage line and a "# text" line per file.
 # The text lines are separated by a literal \n: the current folder, the totals, the bandwidth.
 run() {
-  local done=0 n=0 f elapsed rate eta speed paused where bwtext now last=0
+  local done=0 got shown n=0 f elapsed rate eta speed pct paused where bwtext now last=0
+  local last_file=${files[0]}  # the folder shown is that of the last finished file
   # Speed and time left are based on the last minute: samples of time, bytes done, seconds paused
   local -a sample_t=() sample_done=() sample_paused=()
   printf '%s\0' "${files[@]}" |
     python3 -I -c "$READER" "$PARALLEL" "$bw_mode" "$bw_value" "$MEASURE_SECONDS" "$MEASURE_FILES" \
-      "$infofile" "$nfs_mount" |
+      "$infofile" "$nfs_mount" "$readfile" |
     while IFS= read -r -d '' f; do
-      done=$((done + size[$f]))
-      n=$((n + 1))
+      # An empty entry is the reader's once-per-second tick, not a finished file
+      if [[ -n $f ]]; then
+        done=$((done + size[$f]))
+        n=$((n + 1))
+        last_file=$f
+      fi
+      # Bytes read so far, including files still being read; the sum of finished files is the
+      # minimum, as the reader only reports twice per second
+      read -r got < "$readfile" || true
+      ((${got:-0} > done)) && shown=$got || shown=$done
       # Update the text at most 4 times per second (it costs ~15 ms), and always for the last file
       now=${EPOCHREALTIME/[.,]/}
       ((n == count || now - last >= 250000)) || continue
@@ -324,19 +354,19 @@ run() {
       paused=0
       read -r paused < "$pausefile" || true
       paused=${paused:-0}
-      sample_t+=("$now") sample_done+=("$done") sample_paused+=("$paused")
+      sample_t+=("$now") sample_done+=("$shown") sample_paused+=("$paused")
       while ((${#sample_t[@]} > 2 && now - sample_t[1] >= 60000000)); do
         sample_t=("${sample_t[@]:1}") sample_done=("${sample_done[@]:1}") sample_paused=("${sample_paused[@]:1}")
       done
       # Microseconds since the oldest sample, minus the time paused since then
       elapsed=$(((now - sample_t[0]) - (paused - sample_paused[0]) * 1000000))
       if ((${#sample_t[@]} > 1 && elapsed > 0)); then
-        rate=$(((done - sample_done[0]) * 1000000 / elapsed))
+        rate=$(((shown - sample_done[0]) * 1000000 / elapsed))
       else
         rate=0
       fi
       if ((rate > 0)); then
-        eta=$(((total - done) / rate))
+        eta=$(((total - shown) / rate))
         if ((eta >= 3600)); then
           eta=$(printf '%dh%02dm' $((eta / 3600)) $((eta % 3600 / 60)))
         elif ((eta >= 60)); then
@@ -348,14 +378,15 @@ run() {
       else
         speed="estimating time left..."
       fi
-      where=$(folder_of "$f")
+      where=$(folder_of "$last_file")
       where=${where//\\/\\\\}  # zenity unescapes the text
       bwtext=
       [[ $bw_mode == none ]] || bwtext="\\n$(bandwidth_text)"
       # Text before percentage: zenity --auto-close exits as soon as it reads 100
       printf '# Fetching: %s\\n%d of %d files  ·  %s of %s  ·  %s%s\n' \
-        "$where" "$n" "$count" "$(human "$done")" "$(human "$total")" "$speed" "$bwtext"
-      echo $((done * 100 / total))
+        "$where" "$n" "$count" "$(human "$shown")" "$(human "$total")" "$speed" "$bwtext"
+      # Only the last file may give 100: zenity --auto-close closes the window at 100
+      if ((n == count)); then echo 100; else pct=$((shown * 100 / total)); echo $((pct < 99 ? pct : 99)); fi
     done
 }
 
