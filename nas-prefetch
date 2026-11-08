@@ -383,10 +383,12 @@ run() {
       bwtext=
       [[ $bw_mode == none ]] || bwtext="\\n$(bandwidth_text)"
       # Text before percentage: zenity --auto-close exits as soon as it reads 100
-      printf '# Fetching: %s\\n%d of %d files  ·  %s of %s  ·  %s%s\n' \
-        "$where" "$n" "$count" "$(human "$shown")" "$(human "$total")" "$speed" "$bwtext"
-      # Only the last file may give 100: zenity --auto-close closes the window at 100
-      if ((n == count)); then echo 100; else pct=$((shown * 100 / total)); echo $((pct < 99 ? pct : 99)); fi
+      # The bar follows the data, like the time left; only the last file may give 100, as
+      # zenity --auto-close closes the window at 100
+      if ((n == count)); then pct=100; else pct=$((shown * 100 / total)); ((pct < 99)) || pct=99; fi
+      printf '# Fetching: %s\\n%d%% of data (%s of %s)  ·  %d of %d files  ·  %s%s\n' \
+        "$where" "$pct" "$(human "$shown")" "$(human "$total")" "$n" "$count" "$speed" "$bwtext"
+      echo "$pct"
     done
 }
 
