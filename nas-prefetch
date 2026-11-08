@@ -3,34 +3,67 @@
 # so viewing them afterwards (in XnView or any other viewer) runs at local-disk speed.
 # Requires the mount to be set up with nas-cache-setup.sh. Progress window needs zenity.
 #
-# Usage: nas-prefetch [-r] [-i] [-n N] [-g] PATH...
-#   PATH  a folder, or a file (then its folder is used)
-#   -r    include subfolders
-#   -i    images only (skip videos)
-#   -n N  only the first N files (alphabetical)
-#   -g    show a progress window (default when not started from a terminal)
+# Usage: nas-prefetch [-r] [-i] [-n N] [-b LIMIT] [-g] PATH...
+#   PATH      a folder, or a file (then its folder is used)
+#   -r        include subfolders
+#   -i        images only (skip videos)
+#   -n N      only the first N files (alphabetical)
+#   -b LIMIT  bandwidth limit: 50% (of the measured maximum), 5M (bytes/s), 40Mbit, or off
+#   -g        show a progress window (default when not started from a terminal)
+# Defaults can be set in ~/.config/nas-prefetch.conf (see README).
 set -euo pipefail
 
 IMAGES='jpg|jpeg|png|gif|bmp|tif|tiff|webp|heic|heif|avif|dng|cr2|cr3|nef|arw|orf|rw2|raf|pef|srw'
 VIDEOS='mp4|mov|m4v|mkv|avi|mts|m2ts|3gp|wmv|webm|mpg|mpeg'
-PARALLEL=4
 
+# Settings; override them in the config file
+PARALLEL=4          # files read at the same time
+BANDWIDTH=50%       # off, a percentage (50%) or a fixed rate (5M = 5 MiB/s, 40Mbit)
+MEASURE_SECONDS=15  # percentage limit: measure the maximum speed for this many seconds...
+MEASURE_FILES=10    # ...or this many files, whichever comes first
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/nas-prefetch.conf
+# shellcheck source=/dev/null
+[[ -f $conf ]] && source "$conf"
+
+usage() { sed -n '6,13p' "$0"; exit 1; }
 depth=(-maxdepth 1)
 exts="$IMAGES|$VIDEOS"
 limit=0
 gui=false
 [[ -t 1 ]] || gui=true
-while getopts "rin:gh" opt; do
+while getopts "rin:b:gh" opt; do
   case $opt in
     r) depth=() ;;
     i) exts="$IMAGES" ;;
     n) limit=$OPTARG ;;
+    b) BANDWIDTH=$OPTARG ;;
     g) gui=true ;;
-    *) sed -n '6,11p' "$0"; exit 1 ;;
+    *) usage ;;
   esac
 done
 shift $((OPTIND - 1))
-[[ $# -gt 0 ]] || { sed -n '6,11p' "$0"; exit 1; }
+[[ $# -gt 0 ]] || usage
+
+# Bandwidth setting -> bw_mode (none, flat or pct) and bw_value (bytes/s or percent)
+bw=${BANDWIDTH,,}
+bw=${bw// /}
+bw=${bw%/s}
+[[ $bw == *bps ]] && bw=${bw%bps}bit  # Mbps = Mbit/s
+if [[ -z $bw || $bw == off || $bw == none || $bw == 0 ]]; then
+  bw_mode=none bw_value=0
+elif [[ $bw =~ ^([0-9]+)%$ ]] && ((BASH_REMATCH[1] >= 1 && BASH_REMATCH[1] <= 100)); then
+  bw_mode=pct bw_value=${BASH_REMATCH[1]}
+elif [[ $bw =~ ^([0-9]+([.][0-9]+)?)([kmg]?)(bit|b)?$ ]]; then
+  # Bytes use 1024 steps (like the progress display), bits use 1000 steps (like network speeds)
+  bw_value=$(awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" -v bits="${BASH_REMATCH[4]}" 'BEGIN {
+    p = (u == "") ? 0 : index("kmg", u); step = (bits == "bit") ? 1000 : 1024
+    v = n * (p ? step ^ p : 1); if (bits == "bit") v /= 8; printf "%d", v }')
+  bw_mode=flat
+  ((bw_value > 0)) || bw_mode=none
+else
+  echo "Invalid bandwidth limit '$BANDWIDTH': use e.g. 50%, 5M, 40Mbit or off" >&2
+  exit 1
+fi
 
 notify() {
   echo "$1"
@@ -76,53 +109,254 @@ count=${#files[@]}
 ((count > 0)) || { notify "No photos/videos found in ${dirs[*]}"; exit 0; }
 ((total > 0)) || total=1
 
-# Reads the files, printing zenity-style progress: a percentage line and a "# text" line per file
+# Folder of a file, shown relative to the parent of the prefetched folder (e.g. "2025/Holiday")
+folder_of() {
+  local where=${1%/*} d
+  for d in "${dirs[@]}"; do
+    d=${d%/}
+    if [[ -n $d && ($where == "$d" || $where == "$d"/*) ]]; then
+      where=${d##*/}${where#"$d"}
+      break
+    fi
+  done
+  echo "$where"
+}
+
+# Reads NUL-separated paths from stdin with PARALLEL threads under one shared bandwidth limit,
+# and prints each path (NUL-terminated) once it has been read completely.
+# Percentage mode first runs at full speed until MEASURE_SECONDS or MEASURE_FILES is reached,
+# then limits to that percentage of the measured speed. On an NFS mount the speed comes from the
+# mount's network counter (/proc/self/mountstats), so files already in the cache (read from local
+# disk) do not inflate it; a measurement with less than 1 MiB of network traffic starts over.
+# Writes the current limit to INFOFILE: "measuring", or "limit BYTES_PER_S [MEASURED_MAX]".
+# Time while the process is stopped (Pause) or suspended is not counted.
+# Args: PARALLEL MODE(none|flat|pct) VALUE MEASURE_SECONDS MEASURE_FILES INFOFILE NFS_MOUNTPOINT
+READER=$(cat <<'PY'
+import os, re, sys, threading, time
+
+parallel, mode, value = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+measure_s, measure_n = float(sys.argv[4]), int(sys.argv[5])
+infofile, mountpoint = sys.argv[6], sys.argv[7]
+CHUNK = 1 << 20
+
+files = sys.stdin.buffer.read().split(b"\0")
+if files and files[-1] == b"":
+    files.pop()
+queue = iter(files)
+lock = threading.Lock()
+nread = ndone = 0
+
+
+def info(text):
+    with open(infofile + ".tmp", "w") as f:
+        f.write(text + "\n")
+    os.replace(infofile + ".tmp", infofile)
+
+
+class Bucket:
+    """Token bucket shared by all threads; rate 0 means unlimited."""
+
+    def __init__(self, rate):
+        self.lock = threading.Lock()
+        self.set(rate)
+
+    def set(self, rate):
+        with self.lock:
+            self.rate, self.tokens, self.t = rate, 0.0, time.monotonic()
+
+    def take(self, n):
+        with self.lock:
+            now = time.monotonic()
+            if self.rate <= 0:
+                return
+            # Cap the refill, so a pause does not lead to a burst afterwards
+            burst = max(self.rate / 2, CHUNK)
+            self.tokens = min(self.tokens + (now - self.t) * self.rate, burst) - n
+            self.t = now
+            wait = -self.tokens / self.rate if self.tokens < 0 else 0
+        if wait:
+            time.sleep(wait)
+
+
+bucket = Bucket(value if mode == "flat" else 0)
+
+
+def worker():
+    global nread, ndone
+    buf = bytearray(CHUNK)
+    while True:
+        with lock:
+            path = next(queue, None)
+        if path is None:
+            return
+        try:
+            with open(path, "rb", buffering=0) as f:
+                if bucket.rate > 0:
+                    # No kernel read-ahead, so the network follows the limit smoothly
+                    # instead of fetching 16 MB bursts at full speed
+                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
+                while n := f.readinto(buf):
+                    with lock:
+                        nread += n
+                    bucket.take(n)
+        except OSError as e:
+            print(f"nas-prefetch: {e}", file=sys.stderr)
+            continue
+        with lock:
+            ndone += 1
+            sys.stdout.buffer.write(path + b"\0")
+            sys.stdout.buffer.flush()
+
+
+def network_bytes():
+    """Bytes this NFS mount has read from the server, or None if unavailable."""
+    try:
+        with open("/proc/self/mountstats") as f:
+            section = False
+            for line in f:
+                if line.startswith("device "):
+                    m = re.search(r" mounted on (\S+) with fstype nfs", line)
+                    path = m and re.sub(r"\\([0-7]{3})", lambda o: chr(int(o.group(1), 8)), m.group(1))
+                    section = bool(mountpoint) and path == mountpoint
+                elif section and line.split()[:1] == ["bytes:"]:
+                    return int(line.split()[5])  # serverreadbytes
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
+
+
+def measure():
+    source = network_bytes if network_bytes() is not None else (lambda: nread)
+    while True:
+        bytes0, files0, active, last = source(), ndone, 0.0, time.monotonic()
+        while active < measure_s and ndone - files0 < measure_n:
+            time.sleep(0.1)
+            now = time.monotonic()
+            active += min(now - last, 0.1)  # skip time spent paused
+            last = now
+        got = source() - bytes0
+        if got >= CHUNK:
+            break
+    top = got / active
+    limit = max(top * value / 100, 1024)
+    bucket.set(limit)
+    info(f"limit {limit:.0f} {top:.0f}")
+
+
+if mode == "pct":
+    info("measuring")
+    threading.Thread(target=measure, daemon=True).start()
+elif mode == "flat":
+    info(f"limit {value:.0f}")
+threads = [threading.Thread(target=worker) for _ in range(parallel)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+PY
+)
+
+# Temporary files: progress, seconds paused, bandwidth info
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+status=$tmp/status pausefile=$tmp/paused infofile=$tmp/bandwidth
+echo 0 > "$pausefile"
+: > "$infofile"
+nfs_mount=$(findmnt -no FSTYPE,TARGET -T "${dirs[0]}" | awk '$1 ~ /^nfs/ { sub(/^[^ ]+ +/, ""); print }')
+
+# Bandwidth line for the progress text
+bandwidth_text() {
+  local kind lim top
+  read -r kind lim top < "$infofile" || true
+  case $kind in
+    measuring) echo "Bandwidth: measuring maximum speed for the ${bw_value}% limit..." ;;
+    limit)
+      if [[ -n $top ]]; then
+        echo "Bandwidth limit: $(human "$lim")/s (${bw_value}% of measured $(human "$top")/s)"
+      else
+        echo "Bandwidth limit: $(human "$lim")/s"
+      fi ;;
+  esac
+}
+
+# Reads the files, printing zenity-style progress: a percentage line and a "# text" line per file.
+# The text lines are separated by a literal \n: the current folder, the totals, the bandwidth.
 run() {
-  local done=0 n=0 start=$SECONDS f elapsed rate eta
+  local done=0 n=0 start=$SECONDS f elapsed rate eta paused where bwtext now last=0
   printf '%s\0' "${files[@]}" |
-    xargs -0 -P "$PARALLEL" -n 1 sh -c 'cat "$1" > /dev/null && printf "%s\0" "$1"' _ |
+    python3 -I -c "$READER" "$PARALLEL" "$bw_mode" "$bw_value" "$MEASURE_SECONDS" "$MEASURE_FILES" \
+      "$infofile" "$nfs_mount" |
     while IFS= read -r -d '' f; do
       done=$((done + size[$f]))
       n=$((n + 1))
-      elapsed=$((SECONDS - start))
+      # Update the text at most 4 times per second (it costs ~15 ms), and always for the last file
+      now=${EPOCHREALTIME/[.,]/}
+      ((n == count || now - last >= 250000)) || continue
+      last=$now
+      paused=0
+      read -r paused < "$pausefile" || true
+      elapsed=$((SECONDS - start - ${paused:-0}))
       rate=$((done / (elapsed > 0 ? elapsed : 1)))
       eta=$(((total - done) / (rate > 0 ? rate : 1)))
+      where=$(folder_of "$f")
+      where=${where//\\/\\\\}  # zenity unescapes the text
+      bwtext=
+      [[ $bw_mode == none ]] || bwtext="\\n$(bandwidth_text)"
       # Text before percentage: zenity --auto-close exits as soon as it reads 100
-      printf '# %d of %d files  ·  %s of %s  ·  %s/s  ·  ~%dh%02dm left\n' \
-        "$n" "$count" "$(human "$done")" "$(human "$total")" "$(human "$rate")" \
-        $((eta / 3600)) $((eta % 3600 / 60))
+      printf '# Fetching: %s\\n%d of %d files  ·  %s of %s  ·  %s/s  ·  ~%dh%02dm left%s\n' \
+        "$where" "$n" "$count" "$(human "$done")" "$(human "$total")" "$(human "$rate")" \
+        $((eta / 3600)) $((eta % 3600 / 60)) "$bwtext"
       echo $((done * 100 / total))
     done
 }
 
 start=$SECONDS
 if $gui; then
-  # Prefetch runs as its own job (process group); the window only follows its progress file,
-  # so closing/cancelling the window asks for confirmation before anything is stopped
-  status=$(mktemp)
-  trap 'rm -f "$status"' EXIT
+  # Prefetch runs as its own job (process group); the window only follows its progress file.
+  # Pause (or closing the window) freezes the job, then asks whether to resume or stop.
   set -m
   run > "$status" &
   job=$!
   set +m
+  paused=0
   while kill -0 "$job" 2>/dev/null; do
-    zenity --progress --title="NAS prefetch" --width=500 --auto-close \
+    zenity --progress --title="NAS prefetch" --width=500 --auto-close --cancel-label="Pause" \
       --text="Prefetching $count files ($(human "$total")) from ${dirs[*]}..." \
       < <(tail -n 2 -f --pid="$job" "$status") && break
     kill -0 "$job" 2>/dev/null || break
+    kill -STOP -- -"$job" 2>/dev/null || true
+    pause_start=$SECONDS
     if zenity --question --default-cancel --title="NAS prefetch" --width=350 \
-        --ok-label="Stop prefetch" --cancel-label="Keep running" \
-        --text="Stop prefetching ${dirs[*]}?\n\nFiles loaded so far stay cached."; then
-      kill -- -"$job" 2>/dev/null || true
+        --ok-label="Stop prefetch" --cancel-label="Resume" \
+        --text="Prefetch paused: ${dirs[*]}\n\nFiles loaded so far stay cached."; then
+      # A stopped process only acts on TERM once it is continued
+      kill -TERM -- -"$job" 2>/dev/null || true
+      kill -CONT -- -"$job" 2>/dev/null || true
       notify "Prefetch cancelled"
       exit 1
     fi
+    paused=$((paused + SECONDS - pause_start))
+    echo "$paused" > "$pausefile.tmp" && mv "$pausefile.tmp" "$pausefile"
+    kill -CONT -- -"$job" 2>/dev/null || true
   done
   wait "$job" || true
 else
   echo "Prefetching $count files ($(human "$total")) from ${dirs[*]}..."
+  cols=$(tput cols 2>/dev/null || echo 80)
+  shown_bw=
   run | while IFS= read -r line; do
-    if [[ $line == '#'* ]]; then printf '\r\033[K%s' "${line#\# }"; fi
+    if [[ $line == '#'* ]]; then
+      line=${line#\# Fetching: }
+      IFS=$'\n' read -r -d '' folder totals bwline < <(printf '%s\0' "${line//\\n/$'\n'}") || true
+      # The bandwidth line is printed once whenever it changes; the progress line shows
+      # the totals first, then the folder
+      if [[ -n $bwline && $bwline != "$shown_bw" ]]; then
+        printf '\r\033[K%s\n' "$bwline"
+        shown_bw=$bwline
+      fi
+      line="$totals  ·  $folder"
+      printf '\r\033[K%s' "${line:0:cols-1}"
+    fi
   done
   echo
 fi

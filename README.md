@@ -16,6 +16,7 @@ It works below the viewer, so it helps XnView MP, file managers, video players a
 - Debian/Ubuntu-based Linux (the setup script uses `apt`)
 - The NAS mounted over NFS, with an entry in `/etc/fstab`
 - `zenity` for the progress window (preinstalled on most desktops)
+- `python3` (preinstalled on Debian/Ubuntu/Mint)
 
 ## Install
 
@@ -51,11 +52,35 @@ nas-prefetch -r /mnt/nas/Photos/2025       # including subfolders
 nas-prefetch -i /mnt/nas/Photos/2025       # photos only, skip videos
 nas-prefetch -n 50 /mnt/nas/Photos/2025    # only the first 50 files
 nas-prefetch -g /mnt/nas/Photos/2025       # progress window instead of terminal output
+nas-prefetch -b 50% /mnt/nas/Photos/2025   # use at most half of the available bandwidth
+nas-prefetch -b 5M /mnt/nas/Photos/2025    # at most 5 MiB/s (also: 40Mbit, 500K, off)
 ```
 
-Passing a file instead of a folder prefetches the folder it is in. When started outside a terminal (e.g. from a viewer's menu) it shows a progress window automatically. Cancelling the window asks for confirmation first, with "Keep running" as the default.
+Passing a file instead of a folder prefetches the folder it is in. When started outside a terminal (e.g. from a viewer's menu) it shows a progress window automatically. The window shows which folder is being fetched (useful with `-r`), the number of files and data done, the speed and the time left.
+
+**Pause** freezes the prefetch and asks whether to resume or stop, with "Resume" as the default. Closing the window does the same. Files loaded so far stay cached either way, and time spent paused does not count towards the speed or time-left estimate. In a terminal, pause with Ctrl+Z and continue with `fg`.
 
 Prefetching costs as much time and data as viewing the files once, so on a slow link use `-i` or `-n` for large video folders.
+
+### Bandwidth limit
+
+By default prefetching uses at most 50% of the measured maximum speed, to leave room for other traffic (video calls, streaming, other people on the network). Use `-b off` for full speed, or set a different limit:
+
+- **A fixed rate**, e.g. `5M` (MiB/s), `500K` or `40Mbit`.
+- **A percentage**, e.g. `50%`. Prefetching first runs at full speed for 15 seconds or 10 files, whichever comes first, to measure the maximum speed. After that it is limited to that percentage of the measurement. The speed is measured from the NFS mount's network counter, so files that are already cached don't inflate it. If less than 1 MiB came over the network, the measurement starts over.
+
+The limit covers all files read at the same time together. The progress window shows the active limit. Measurements count other traffic on the same NAS mount too, such as browsing photos while it measures.
+
+### Settings
+
+Defaults go in `~/.config/nas-prefetch.conf`. This is useful when prefetch is started from XnView, where you can't pass options. Command-line options override the file.
+
+```bash
+BANDWIDTH=50%       # off, a percentage, or a fixed rate like 5M or 40Mbit
+MEASURE_SECONDS=15  # percentage limit: measure the maximum speed for this many seconds...
+MEASURE_FILES=10    # ...or this many files, whichever comes first
+PARALLEL=4          # files read at the same time
+```
 
 ### XnView MP integration
 
