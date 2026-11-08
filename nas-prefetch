@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Pre-load photos/videos from an NFS (NAS) folder into the local disk cache (FS-Cache),
+# so viewing them afterwards (in XnView or any other viewer) runs at local-disk speed.
+# Requires the mount to be set up with nas-cache-setup.sh. Progress window needs zenity.
+#
+# Usage: nas-prefetch [-r] [-i] [-n N] [-g] PATH...
+#   PATH  a folder, or a file (then its folder is used)
+#   -r    include subfolders
+#   -i    images only (skip videos)
+#   -n N  only the first N files (alphabetical)
+#   -g    show a progress window (default when not started from a terminal)
+set -euo pipefail
+
+IMAGES='jpg|jpeg|png|gif|bmp|tif|tiff|webp|heic|heif|avif|dng|cr2|cr3|nef|arw|orf|rw2|raf|pef|srw'
+VIDEOS='mp4|mov|m4v|mkv|avi|mts|m2ts|3gp|wmv|webm|mpg|mpeg'
+PARALLEL=4
+
+depth=(-maxdepth 1)
+exts="$IMAGES|$VIDEOS"
+limit=0
+gui=false
+[[ -t 1 ]] || gui=true
+while getopts "rin:gh" opt; do
+  case $opt in
+    r) depth=() ;;
+    i) exts="$IMAGES" ;;
+    n) limit=$OPTARG ;;
+    g) gui=true ;;
+    *) sed -n '6,11p' "$0"; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -gt 0 ]] || { sed -n '6,11p' "$0"; exit 1; }
+
+notify() {
+  echo "$1"
+  $gui && { notify-send -i image "NAS prefetch" "$1" 2>/dev/null || true; }
+}
+human() { numfmt --to=iec --suffix=B --format='%.1f' "$1"; }
+
+# Unique folders from the given paths
+mapfile -t dirs < <(for p in "$@"; do [[ -d $p ]] && echo "$p" || dirname "$p"; done | sort -u)
+
+for d in "${dirs[@]}"; do
+  if ! findmnt -no FSTYPE,OPTIONS -T "$d" | grep -q '^nfs.*[ ,]fsc\(,\|$\)'; then
+    echo "Warning: $d is not on an NFS mount with the disk cache (fsc); files will only be cached in RAM."
+  fi
+done
+
+# Window while listing; no Cancel button, so a stray Enter cannot stop anything
+listwin=
+if $gui; then
+  exec 3> >(zenity --progress --pulsate --no-cancel --title="NAS prefetch" --width=500 \
+    --text="Listing files in ${dirs[*]}..." 2>/dev/null)
+  listwin=$!
+fi
+
+# "path<TAB>size" entries, sorted by path
+mapfile -d '' entries < <(
+  find "${dirs[@]}" "${depth[@]}" -type f -regextype posix-extended -iregex ".*\.($exts)$" -printf '%p\t%s\0' |
+    sort -z | { if ((limit > 0)); then head -z -n "$limit"; else cat; fi; }
+)
+
+declare -A size
+files=()
+total=0
+for e in "${entries[@]}"; do
+  f=${e%$'\t'*}
+  files+=("$f")
+  size[$f]=${e##*$'\t'}
+  total=$((total + size[$f]))
+done
+
+if [[ -n $listwin ]]; then exec 3>&-; kill "$listwin" 2>/dev/null || true; fi
+count=${#files[@]}
+((count > 0)) || { notify "No photos/videos found in ${dirs[*]}"; exit 0; }
+((total > 0)) || total=1
+
+# Reads the files, printing zenity-style progress: a percentage line and a "# text" line per file
+run() {
+  local done=0 n=0 start=$SECONDS f elapsed rate eta
+  printf '%s\0' "${files[@]}" |
+    xargs -0 -P "$PARALLEL" -n 1 sh -c 'cat "$1" > /dev/null && printf "%s\0" "$1"' _ |
+    while IFS= read -r -d '' f; do
+      done=$((done + size[$f]))
+      n=$((n + 1))
+      elapsed=$((SECONDS - start))
+      rate=$((done / (elapsed > 0 ? elapsed : 1)))
+      eta=$(((total - done) / (rate > 0 ? rate : 1)))
+      # Text before percentage: zenity --auto-close exits as soon as it reads 100
+      printf '# %d of %d files  ·  %s of %s  ·  %s/s  ·  ~%dh%02dm left\n' \
+        "$n" "$count" "$(human "$done")" "$(human "$total")" "$(human "$rate")" \
+        $((eta / 3600)) $((eta % 3600 / 60))
+      echo $((done * 100 / total))
+    done
+}
+
+start=$SECONDS
+if $gui; then
+  # Prefetch runs as its own job (process group); the window only follows its progress file,
+  # so closing/cancelling the window asks for confirmation before anything is stopped
+  status=$(mktemp)
+  trap 'rm -f "$status"' EXIT
+  set -m
+  run > "$status" &
+  job=$!
+  set +m
+  while kill -0 "$job" 2>/dev/null; do
+    zenity --progress --title="NAS prefetch" --width=500 --auto-close \
+      --text="Prefetching $count files ($(human "$total")) from ${dirs[*]}..." \
+      < <(tail -n 2 -f --pid="$job" "$status") && break
+    kill -0 "$job" 2>/dev/null || break
+    if zenity --question --default-cancel --title="NAS prefetch" --width=350 \
+        --ok-label="Stop prefetch" --cancel-label="Keep running" \
+        --text="Stop prefetching ${dirs[*]}?\n\nFiles loaded so far stay cached."; then
+      kill -- -"$job" 2>/dev/null || true
+      notify "Prefetch cancelled"
+      exit 1
+    fi
+  done
+  wait "$job" || true
+else
+  echo "Prefetching $count files ($(human "$total")) from ${dirs[*]}..."
+  run | while IFS= read -r line; do
+    if [[ $line == '#'* ]]; then printf '\r\033[K%s' "${line#\# }"; fi
+  done
+  echo
+fi
+notify "Done: $count files ($(human "$total")) cached in $(((SECONDS - start) / 60)) min"
