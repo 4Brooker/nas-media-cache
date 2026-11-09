@@ -134,14 +134,15 @@ folder_of() {
 # and the number of bytes read so far to READFILE twice per second. Once per second it also
 # prints an empty entry (a lone NUL), so the progress display updates during large files.
 # Time while the process is stopped (Pause) or suspended is not counted.
+# When REMEASUREFILE appears (on Resume), percentage mode removes it and measures again.
 # Args: PARALLEL MODE(none|flat|pct) VALUE MEASURE_SECONDS MEASURE_FILES INFOFILE NFS_MOUNTPOINT
-#       READFILE
+#       READFILE REMEASUREFILE
 READER=$(cat <<'PY'
 import os, re, sys, threading, time
 
 parallel, mode, value = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
 measure_s, measure_n = float(sys.argv[4]), int(sys.argv[5])
-infofile, mountpoint, readfile = sys.argv[6], sys.argv[7], sys.argv[8]
+infofile, mountpoint, readfile, remeasurefile = sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9]
 CHUNK = 1 << 20
 
 files = sys.stdin.buffer.read().split(b"\0")
@@ -166,6 +167,10 @@ def report():
     tick = 0
     while True:
         write(readfile, str(nread))
+        if os.path.exists(remeasurefile):
+            os.remove(remeasurefile)
+            if mode == "pct":
+                start_measuring()
         tick += 1
         if tick % 2 == 0:
             with lock:
@@ -249,11 +254,18 @@ def worker():
             return
         try:
             with open(path, "rb", buffering=0) as f:
-                if bucket.rate > 0:
-                    # No kernel read-ahead, so the network follows the limit smoothly
-                    # instead of fetching 16 MB bursts at full speed
-                    os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
+                readahead = True
                 while True:
+                    # While limited: no kernel read-ahead, so the network follows the limit
+                    # smoothly instead of fetching 16 MB bursts at full speed. While measuring:
+                    # normal read-ahead, so the measurement gets the full speed.
+                    if readahead != (bucket.rate <= 0):
+                        readahead = not readahead
+                        advice = os.POSIX_FADV_NORMAL if readahead else os.POSIX_FADV_RANDOM
+                        try:
+                            os.posix_fadvise(f.fileno(), 0, 0, advice)
+                        except OSError:
+                            pass  # not supported here (e.g. a pipe): read without it
                     bucket.wait()
                     n = f.readinto(buf)
                     if not n:
@@ -270,10 +282,25 @@ def worker():
             sys.stdout.buffer.flush()
 
 
-def measure():
+measurement = 0  # number of the current measurement; an older one stops
+
+
+def start_measuring():
+    global measurement
+    with lock:
+        measurement += 1
+        number = measurement
+    bucket.set(0)
+    info("measuring")
+    threading.Thread(target=measure, args=(number,), daemon=True).start()
+
+
+def measure(number):
     while True:
         net0, read0, files0, active, last = traffic(), nread, ndone, 0.0, time.monotonic()
         while active < measure_s and ndone - files0 < measure_n:
+            if number != measurement:
+                return
             time.sleep(0.1)
             now = time.monotonic()
             active += min(now - last, 0.1)  # skip time spent paused
@@ -284,14 +311,16 @@ def measure():
             break
     top = got / active
     limit = max(top * value / 100, 1024)
-    bucket.set(limit)
-    info(f"limit {limit:.0f} {top:.0f}")
+    with lock:
+        if number != measurement:
+            return
+        bucket.set(limit)
+        info(f"limit {limit:.0f} {top:.0f}")
 
 
 threading.Thread(target=report, daemon=True).start()
 if mode == "pct":
-    info("measuring")
-    threading.Thread(target=measure, daemon=True).start()
+    start_measuring()
 elif mode == "flat":
     info(f"limit {value:.0f}")
 threads = [threading.Thread(target=worker) for _ in range(parallel)]
@@ -305,7 +334,7 @@ PY
 # Temporary files: progress, seconds paused, bandwidth info
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-status=$tmp/status pausefile=$tmp/paused infofile=$tmp/bandwidth readfile=$tmp/read
+status=$tmp/status pausefile=$tmp/paused infofile=$tmp/bandwidth readfile=$tmp/read remeasurefile=$tmp/remeasure
 echo 0 > "$pausefile"
 echo 0 > "$readfile"
 : > "$infofile"
@@ -335,7 +364,7 @@ run() {
   local -a sample_t=() sample_done=() sample_paused=()
   printf '%s\0' "${files[@]}" |
     python3 -I -c "$READER" "$PARALLEL" "$bw_mode" "$bw_value" "$MEASURE_SECONDS" "$MEASURE_FILES" \
-      "$infofile" "$nfs_mount" "$readfile" |
+      "$infofile" "$nfs_mount" "$readfile" "$remeasurefile" |
     while IFS= read -r -d '' f; do
       # An empty entry is the reader's once-per-second tick, not a finished file
       if [[ -n $f ]]; then
@@ -427,6 +456,8 @@ if $gui; then
     fi
     paused=$((paused + SECONDS - pause_start))
     echo "$paused" > "$pausefile.tmp" && mv "$pausefile.tmp" "$pausefile"
+    # Conditions may have changed while paused: measure the maximum speed again
+    [[ $bw_mode == pct ]] && : > "$remeasurefile"
     kill -CONT -- -"$job" 2>/dev/null || true
   done
   wait "$job" || true

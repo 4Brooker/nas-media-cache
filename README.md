@@ -58,7 +58,7 @@ nas-prefetch -b 5M /mnt/nas/Photos/2025    # at most 5 MiB/s (also: 40Mbit, 500K
 
 Passing a file instead of a folder prefetches the folder it is in. When started outside a terminal (e.g. from a viewer's menu) it shows a progress window automatically. The window shows which folder is being fetched (useful with `-r`), the number of files and data done, the speed and the time left.
 
-**Pause** freezes the prefetch and asks whether to resume or stop, with "Resume" as the default. Closing the window does the same. Files loaded so far stay cached either way, and time spent paused does not count towards the speed or time-left estimate. In a terminal, pause with Ctrl+Z and continue with `fg`.
+**Pause** freezes the prefetch and asks whether to resume or stop, with "Resume" as the default. Closing the window does the same. Files loaded so far stay cached either way, and time spent paused does not count towards the speed or time-left estimate. With a percentage limit, Resume measures the maximum speed again, since the network may have changed while the prefetch was paused. In a terminal, pause with Ctrl+Z and continue with `fg`.
 
 Prefetching costs as much time and data as viewing the files once, so on a slow link use `-i` or `-n` for large video folders.
 
